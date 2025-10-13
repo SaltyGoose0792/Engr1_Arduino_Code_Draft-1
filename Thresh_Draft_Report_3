@@ -1,0 +1,148 @@
+#include <SimpleDHT.h>
+#include <Stepper.h>
+
+// -------------------- USER SETTINGS --------------------
+const bool USE_RH_MODE = false;   // using VPD mode as before
+
+// RH-mode thresholds (unused when USE_RH_MODE=false)
+const int RH_HIGH = 60;
+const int RH_LOW  = 50;
+
+// VPD thresholds tuned for your baseline ~0.97 kPa
+const float VPD_HUMID_MAX = 0.85f;  // <= 0.85 -> HUMID (CCW 90°)
+const float VPD_DRY_MIN   = 1.20f;  // >= 1.20 -> DRY  (CW  90°)
+
+// Water sensor
+const int WATER_A_PIN = A0;        // analog output from water sensor
+int WATER_WET_THRESHOLD = 100;     // set after watching Serial
+
+// Reading cadence
+const unsigned long READ_PERIOD_MS = 2000;
+
+// Stepper behavior
+const long STEPS_PER_REV = 2048;
+const int  START_RPM     = 8;
+const int  CHUNK_STEPS   = 8;
+const int  CHUNK_DELAY   = 15;
+
+// Pins
+const int DHT_PIN = 7;             // your DHT11 signal
+Stepper stepper(STEPS_PER_REV, 8, 10, 9, 11);
+SimpleDHT11 dht(DHT_PIN);
+
+// -------------------- STATE --------------------
+enum Position { POS_DRY_CW = 0, POS_HUMID_CCW = 1 };
+Position currentPos = POS_DRY_CW;
+unsigned long lastRead = 0;
+
+// -------------------- HELPERS --------------------
+void moveSlow(int stepsTotal) {
+  int remaining = stepsTotal;
+  int direction = (stepsTotal >= 0) ? 1 : -1;
+  while (remaining != 0) {
+    int thisChunk = CHUNK_STEPS;
+    if (abs(remaining) < CHUNK_STEPS) thisChunk = abs(remaining);
+    stepper.step(direction * thisChunk);
+    remaining -= direction * thisChunk;
+    delay(CHUNK_DELAY);
+  }
+}
+
+void goTo(Position target) {
+  if (target == currentPos) return;
+  long steps90 = STEPS_PER_REV / 4; // 90 degrees
+  if (target == POS_HUMID_CCW && currentPos == POS_DRY_CW) {
+    moveSlow(+steps90); // CCW 90°
+  } else if (target == POS_DRY_CW && currentPos == POS_HUMID_CCW) {
+    moveSlow(-steps90); // CW 90°
+  }
+  currentPos = target;
+}
+
+// Saturation vapor pressure (kPa) via Magnus formula; T in °C
+float saturation_kPa(float T) {
+  return 0.6108f * expf((17.27f * T) / (T + 237.3f));
+}
+
+// VPD (kPa) given T(°C) and RH(%)
+float vpd_kPa(float T, float RH) {
+  float es = saturation_kPa(T);
+  return es * (1.0f - RH / 100.0f);
+}
+
+// -------------------- ARDUINO --------------------
+void setup() {
+  Serial.begin(9600);
+  stepper.setSpeed(START_RPM);
+  pinMode(WATER_A_PIN, INPUT);
+
+  Serial.println(F("== DHT11 + Water Sensor + Stepper Two-Position =="));
+  Serial.println(F("Water forces DRY/CW 90°. VPD handles CCW/CW otherwise."));
+  Serial.print(F("Mode: ")); Serial.println(USE_RH_MODE ? F("RH thresholds") : F("VPD thresholds"));
+  Serial.print(F("VPD HUMID_MAX=")); Serial.print(VPD_HUMID_MAX, 2);
+  Serial.print(F("  VPD DRY_MIN=")); Serial.println(VPD_DRY_MIN, 2);
+  Serial.print(F("Water threshold A0 >= ")); Serial.println(WATER_WET_THRESHOLD);
+}
+
+void loop() {
+  // Manual commands
+  if (Serial.available()) {
+    char ch = Serial.read();
+    if (ch == 'h') { Serial.println(F("[Manual] HUMID(CCW 90°)")); goTo(POS_HUMID_CCW); }
+    if (ch == 'd') { Serial.println(F("[Manual] DRY(CW 90°)"));   goTo(POS_DRY_CW); }
+    if (ch == 's') {
+      Serial.print(F("[Status] Position="));
+      Serial.println(currentPos == POS_HUMID_CCW ? F("HUMID(CCW)") : F("DRY(CW)"));
+    }
+  }
+
+  // --- Water sensor check (runs every loop; quick) ---
+  int waterVal = analogRead(WATER_A_PIN);
+  if (waterVal >= WATER_WET_THRESHOLD) {
+    if (currentPos != POS_DRY_CW) {
+      Serial.print(F("[Water] A0=")); Serial.print(waterVal);
+      Serial.println(F(" >= THRESH -> DRY (CW 90°)"));
+      goTo(POS_DRY_CW);
+      delay(500); // brief debounce
+    }
+  }
+
+  // --- Timed DHT11 read / VPD logic ---
+  if (millis() - lastRead < READ_PERIOD_MS) return;
+  lastRead = millis();
+
+  byte tC = 0, rh = 0;
+  if (dht.read(&tC, &rh, NULL) != SimpleDHTErrSuccess) {
+    Serial.println(F("DHT read failed (will retry)"));
+    return;
+  }
+
+  float T = (float)tC;
+  float RH = (float)rh;
+  float VPD = vpd_kPa(T, RH);
+
+  Serial.print(F("T=")); Serial.print(T); Serial.print(F("C  RH="));
+  Serial.print(RH); Serial.print(F("%  VPD="));
+  Serial.print(VPD, 3); Serial.print(F(" kPa  Water A0="));
+  Serial.println(waterVal);
+
+  // If water was wet this cycle, we already forced DRY; otherwise do humidity logic
+  if (waterVal < WATER_WET_THRESHOLD) {
+    Position want = currentPos;
+    if (USE_RH_MODE) {
+      if (RH >= RH_HIGH)           want = POS_HUMID_CCW;
+      else if (RH <= RH_LOW)       want = POS_DRY_CW;
+    } else {
+      if (VPD <= VPD_HUMID_MAX)    want = POS_HUMID_CCW;  // humid → CCW
+      else if (VPD >= VPD_DRY_MIN) want = POS_DRY_CW;     // dry   → CW
+    }
+
+    if (want != currentPos) {
+      Serial.print(F("[Decision] "));
+      Serial.println(want == POS_HUMID_CCW ? F("HUMID(CCW 90°)") : F("DRY(CW 90°)"));
+      goTo(want);
+    } else {
+      Serial.println(F("[Hold] No threshold crossing; staying put"));
+    }
+  }
+}

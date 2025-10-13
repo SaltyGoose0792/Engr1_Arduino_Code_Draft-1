@@ -1,0 +1,143 @@
+#include <SimpleDHT.h>
+#include <Stepper.h>
+
+// -------------------- USER SETTINGS --------------------
+// Choose how to decide "humid vs dry".
+// true  = use simple Relative Humidity thresholds (easiest).
+// false = use VPD (accounts for temperature; better for "evaporation feel").
+const bool USE_RH_MODE = false;   // <--- USING VPD mode
+
+// RH-mode thresholds (with hysteresis)  [not used when USE_RH_MODE=false]
+const int RH_HIGH = 60;   // RH >= 60% -> HUMID position (CCW 90°)
+const int RH_LOW  = 50;   // RH <= 50% -> DRY position (CW 90°)
+
+// VPD-mode thresholds (kPa) — smaller VPD = more humid, larger VPD = drier
+// Tuned for your baseline (~0.97 kPa):
+//   VPD <= 0.85 kPa -> HUMID position (CCW 90°)
+//   VPD >= 1.20 kPa -> DRY position  (CW  90°)
+const float VPD_HUMID_MAX = 0.85f;
+const float VPD_DRY_MIN   = 1.00f;
+
+// Reading cadence
+const unsigned long READ_PERIOD_MS = 2000;  // DHT11 needs ~2s between reads
+
+// Stepper behavior
+const long STEPS_PER_REV = 2048;   // try 2048 first; if motion is half, use 4096
+const int  START_RPM     = 8;      // slow & gentle
+const int  CHUNK_STEPS   = 8;      // small bite-sized steps per chunk
+const int  CHUNK_DELAY   = 15;     // ms between chunks
+
+// Pins
+const int DHT_PIN = 7;             // DHT11 signal
+// ULN2003 IN1..IN4 -> Mega pins 8,9,10,11 (Stepper wants 8,10,9,11 for this driver)
+Stepper stepper(STEPS_PER_REV, 8, 10, 9, 11);
+SimpleDHT11 dht(DHT_PIN);
+
+// -------------------- STATE --------------------
+enum Position { POS_DRY_CW = 0, POS_HUMID_CCW = 1 };
+Position currentPos = POS_DRY_CW;   // boot at "dry" home
+unsigned long lastRead = 0;
+
+// -------------------- HELPERS --------------------
+void moveSlow(int stepsTotal) {
+  // Move in small chunks to be gentle on the geartrain
+  int remaining = stepsTotal;
+  int direction = (stepsTotal >= 0) ? 1 : -1;
+  while (remaining != 0) {
+    int thisChunk = CHUNK_STEPS;
+    if (abs(remaining) < CHUNK_STEPS) thisChunk = abs(remaining);
+    stepper.step(direction * thisChunk);
+    remaining -= direction * thisChunk;
+    delay(CHUNK_DELAY);
+  }
+}
+
+void goTo(Position target) {
+  if (target == currentPos) return;
+  long steps90 = STEPS_PER_REV / 4; // 90 degrees
+  if (target == POS_HUMID_CCW && currentPos == POS_DRY_CW) {
+    moveSlow(+steps90); // CCW 90°
+  } else if (target == POS_DRY_CW && currentPos == POS_HUMID_CCW) {
+    moveSlow(-steps90); // CW 90°
+  }
+  currentPos = target;
+}
+
+// Saturation vapor pressure (kPa) via Magnus formula; T in °C
+float saturation_kPa(float T) {
+  // over water
+  return 0.6108f * expf((17.27f * T) / (T + 237.3f));
+}
+
+// VPD (kPa) given T(°C) and RH(%)
+float vpd_kPa(float T, float RH) {
+  float es = saturation_kPa(T);
+  // VPD = es * (1 - RH/100)
+  return es * (1.0f - RH / 100.0f);
+}
+
+// -------------------- ARDUINO --------------------
+void setup() {
+  Serial.begin(9600);
+  stepper.setSpeed(START_RPM);
+  Serial.println(F("== Two-position Stepper Controller (DHT11) =="));
+  Serial.println(F("Manual: 'h' -> HUMID pos (CCW 90°), 'd' -> DRY pos (CW 90°), 's' -> status"));
+  Serial.print(F("Mode: ")); Serial.println(USE_RH_MODE ? F("RH thresholds") : F("VPD thresholds"));
+  Serial.print(F("RPM=")); Serial.println(START_RPM);
+  Serial.println(F("Starting at DRY (home) position."));
+}
+
+void loop() {
+  // Manual commands for quick testing
+  if (Serial.available()) {
+    char ch = Serial.read();
+    if (ch == 'h') { Serial.println(F("[Manual] HUMID position")); goTo(POS_HUMID_CCW); }
+    if (ch == 'd') { Serial.println(F("[Manual] DRY position"));   goTo(POS_DRY_CW); }
+    if (ch == 's') {
+      Serial.print(F("[Status] Position="));
+      Serial.println(currentPos == POS_HUMID_CCW ? F("HUMID(CCW)") : F("DRY(CW)"));
+    }
+  }
+
+  // Timed sensor read
+  if (millis() - lastRead < READ_PERIOD_MS) return;
+  lastRead = millis();
+
+  byte tC = 0, rh = 0;
+  if (dht.read(&tC, &rh, NULL) != SimpleDHTErrSuccess) {
+    Serial.println(F("DHT read failed (will retry)"));
+    return;
+  }
+
+  // Compute decision metrics
+  float T = (float)tC;
+  float RH = (float)rh;
+  float VPD = vpd_kPa(T, RH);
+
+  // Log readings
+  Serial.print(F("T=")); Serial.print(T); Serial.print(F("C  RH="));
+  Serial.print(RH); Serial.print(F("%  VPD="));
+  Serial.print(VPD, 3); Serial.println(F(" kPa"));
+
+  // Decide desired position with hysteresis
+  Position want = currentPos;
+
+  if (USE_RH_MODE) {
+    // "humidity up" -> CCW; "humidity down" -> CW
+    if (RH >= RH_HIGH)             want = POS_HUMID_CCW;
+    else if (RH <= RH_LOW)         want = POS_DRY_CW;
+  } else {
+    // VPD mode: smaller VPD = more humid
+    if (VPD <= VPD_HUMID_MAX)      want = POS_HUMID_CCW;  // humid → CCW
+    else if (VPD >= VPD_DRY_MIN)   want = POS_DRY_CW;     // dry   → CW
+  }
+
+  // Move if we changed bands
+  if (want != currentPos) {
+    Serial.print(F("[Action] Move to "));
+    Serial.println(want == POS_HUMID_CCW ? F("HUMID(CCW)") : F("DRY(CW)"));
+    goTo(want);
+  } else {
+    Serial.println(F("[Hold] No threshold crossing; staying put"));
+  }
+}

@@ -1,0 +1,108 @@
+// === Water Level Sensor (max ~1.5V) + Solenoid via ULN2003/2803 ===
+// Triggers valve OPEN when sensor >= 1.51 V
+// Baud fixed at 9600 for clean Serial Monitor output
+
+// --- Pins ---
+const int sensorPin = A0;   // AO from sensor
+const int valvePin  = 8;    // D8 -> ULN IN1 (OUT1 -> solenoid)
+
+// --- ADC reference (usually 5.00 V from Arduino/buck) ---
+const float VREF = 5.00;    // If your 5V is a bit low/high, tweak this later
+
+// --- Voltage thresholds (VOLTS) ---
+const float ON_V  = 1.51;   // fully saturated -> open valve
+const float OFF_V = 1.45;   // fall-back to close (hysteresis)
+
+// --- Timing / filtering ---
+const unsigned long CONFIRM_MS = 700; // condition must hold this long
+const int SAMPLES = 12;               // average N readings to reduce noise
+
+// --- Fault detection: treat rails as wiring/power fault ---
+const int HI_FAULT = 1015;  // ~5.0V rail
+const int LO_FAULT = 5;     // ~0V rail
+const unsigned long FAULT_HOLD_MS = 1000;
+
+bool valveOn = false;
+unsigned long conditionStart = 0;
+unsigned long faultStart = 0;
+bool faultActive = false;
+
+int readAveragedRaw(int pin, int n) {
+  long sum = 0;
+  for (int i = 0; i < n; i++) {
+    sum += analogRead(pin);
+    delay(2);
+  }
+  return (int)(sum / n);
+}
+
+float rawToVolts(int raw) {
+  return (raw * VREF) / 1023.0;
+}
+
+void setup() {
+  pinMode(valvePin, OUTPUT);
+  digitalWrite(valvePin, LOW);  // start CLOSED (NC valve not energized)
+  Serial.begin(9600);
+  Serial.println("Starting... Voltage-based threshold control (1.51V ON).");
+}
+
+void loop() {
+  int raw = readAveragedRaw(sensorPin, SAMPLES);
+  float v  = rawToVolts(raw);
+  unsigned long now = millis();
+
+  // --- Sensor fault (pegged at rails) ---
+  bool rail = (raw >= HI_FAULT) || (raw <= LO_FAULT);
+  if (rail) {
+    if (faultStart == 0) faultStart = now;
+    if ((now - faultStart) >= FAULT_HOLD_MS) faultActive = true;
+  } else {
+    faultStart = 0;
+    faultActive = false;
+  }
+
+  if (faultActive) {
+    if (valveOn) { valveOn = false; digitalWrite(valvePin, LOW); }
+    Serial.print("Raw: "); Serial.print(raw);
+    Serial.print("  |  V: "); Serial.print(v, 3);
+    Serial.println("  |  FAULT: sensor pegged -> Valve FORCED CLOSED");
+    delay(300);
+    return;
+  }
+
+  // --- Debug print ---
+  Serial.print("Raw: "); Serial.print(raw);
+  Serial.print("  |  V: "); Serial.print(v, 3);
+  Serial.print(" V  |  Valve: ");
+  Serial.println(valveOn ? "OPEN" : "CLOSED");
+
+  // --- Control using voltage thresholds with hysteresis ---
+  if (!valveOn) {
+    if (v >= ON_V) {
+      if (conditionStart == 0) conditionStart = now;
+      if (now - conditionStart >= CONFIRM_MS) {
+        valveOn = true;
+        digitalWrite(valvePin, HIGH);  // energize -> OPEN
+        Serial.println("VALVE -> ON");
+        conditionStart = 0;
+      }
+    } else {
+      conditionStart = 0;
+    }
+  } else {
+    if (v <= OFF_V) {
+      if (conditionStart == 0) conditionStart = now;
+      if (now - conditionStart >= CONFIRM_MS) {
+        valveOn = false;
+        digitalWrite(valvePin, LOW);   // de-energize -> CLOSED
+        Serial.println("VALVE -> OFF");
+        conditionStart = 0;
+      }
+    } else {
+      conditionStart = 0;
+    }
+  }
+
+  delay(300);
+}

@@ -3,10 +3,10 @@
 const int sensorPin = A0;
 const int valvePin  = 8;   // D8 -> ULN IN1 (OUT1 -> solenoid)
 
-// Tuning (start here, adjust with Serial Monitor)
-const int ON_THRESHOLD  = 850;  // 0..1023; set high for "fully saturated"
-const int OFF_THRESHOLD = 800;  // must be lower than ON (hysteresis)
-const unsigned long CONFIRM_MS = 700; // how long condition must hold
+// Tuning (adjust based on readings)
+const int ON_THRESHOLD  = 850;  // open valve when above this
+const int OFF_THRESHOLD = 800;  // close valve when below this
+const unsigned long CONFIRM_MS = 700; // debounce time
 
 // Sampling
 const int SAMPLES = 10;  // averaged per reading
@@ -26,43 +26,50 @@ int readAveraged(int pin, int n) {
 
 void setup() {
   pinMode(valvePin, OUTPUT);
-  digitalWrite(valvePin, LOW);  // valve off
-  Serial.begin(115200);
+  digitalWrite(valvePin, LOW);
+  Serial.begin(115200);  // ✅ turn on Serial Monitor
+  Serial.println("System starting... check water level readings below");
 }
 
 void loop() {
   int level = readAveraged(sensorPin, SAMPLES);
-  Serial.println(level);
+  float voltage = level * (5.0 / 1023.0);  // convert to volts
+
+  // ✅ print readings for debugging
+  Serial.print("Sensor raw: ");
+  Serial.print(level);
+  Serial.print("  |  Voltage: ");
+  Serial.print(voltage, 2);
+  Serial.print(" V  |  Valve: ");
+  Serial.println(valveOn ? "OPEN" : "CLOSED");
 
   unsigned long now = millis();
 
   if (!valveOn) {
-    // looking to turn ON
     if (level >= ON_THRESHOLD) {
       if (conditionStart == 0) conditionStart = now;
       if (now - conditionStart >= CONFIRM_MS) {
         valveOn = true;
-        digitalWrite(valvePin, HIGH); // open valve
-        conditionStart = 0;
+        digitalWrite(valvePin, HIGH);
         Serial.println("VALVE -> ON");
+        conditionStart = 0;
       }
     } else {
       conditionStart = 0;
     }
   } else {
-    // valve is ON; look to turn OFF
     if (level <= OFF_THRESHOLD) {
       if (conditionStart == 0) conditionStart = now;
       if (now - conditionStart >= CONFIRM_MS) {
         valveOn = false;
-        digitalWrite(valvePin, LOW); // close valve
-        conditionStart = 0;
+        digitalWrite(valvePin, LOW);
         Serial.println("VALVE -> OFF");
+        conditionStart = 0;
       }
     } else {
       conditionStart = 0;
     }
   }
 
-  delay(20);
+  delay(500);  // half-second updates
 }

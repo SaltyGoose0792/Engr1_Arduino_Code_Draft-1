@@ -1,0 +1,68 @@
+%This code is for senior project water level sensor, trying to trigger valve
+// Pins
+const int sensorPin = A0;
+const int valvePin  = 8;   // D8 -> ULN IN1 (OUT1 -> solenoid)
+
+// Tuning (start here, adjust with Serial Monitor)
+const int ON_THRESHOLD  = 850;  // 0..1023; set high for "fully saturated"
+const int OFF_THRESHOLD = 800;  // must be lower than ON (hysteresis)
+const unsigned long CONFIRM_MS = 700; // how long condition must hold
+
+// Sampling
+const int SAMPLES = 10;  // averaged per reading
+
+// State
+bool valveOn = false;
+unsigned long conditionStart = 0;
+
+int readAveraged(int pin, int n) {
+  long sum = 0;
+  for (int i = 0; i < n; i++) {
+    sum += analogRead(pin);
+    delay(2);
+  }
+  return (int)(sum / n);
+}
+
+void setup() {
+  pinMode(valvePin, OUTPUT);
+  digitalWrite(valvePin, LOW);  // valve off
+  Serial.begin(115200);
+}
+
+void loop() {
+  int level = readAveraged(sensorPin, SAMPLES);
+  Serial.println(level);
+
+  unsigned long now = millis();
+
+  if (!valveOn) {
+    // looking to turn ON
+    if (level >= ON_THRESHOLD) {
+      if (conditionStart == 0) conditionStart = now;
+      if (now - conditionStart >= CONFIRM_MS) {
+        valveOn = true;
+        digitalWrite(valvePin, HIGH); // open valve
+        conditionStart = 0;
+        Serial.println("VALVE -> ON");
+      }
+    } else {
+      conditionStart = 0;
+    }
+  } else {
+    // valve is ON; look to turn OFF
+    if (level <= OFF_THRESHOLD) {
+      if (conditionStart == 0) conditionStart = now;
+      if (now - conditionStart >= CONFIRM_MS) {
+        valveOn = false;
+        digitalWrite(valvePin, LOW); // close valve
+        conditionStart = 0;
+        Serial.println("VALVE -> OFF");
+      }
+    } else {
+      conditionStart = 0;
+    }
+  }
+
+  delay(20);
+}
